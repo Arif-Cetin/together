@@ -31,10 +31,12 @@ class WebRTCService {
   Function(String sender, String text)? onMessageReceived;
   Function(bool isConnected)? onConnectionStateChanged;
 
+  // 1. Odaya Bağlan ve Sinyalleşmeyi Başlat
   Future<void> connectToRoom(String roomId, String username) async {
     _roomId = roomId;
     _myId = '${username}_${DateTime.now().millisecondsSinceEpoch % 10000}';
 
+    // Şifre hash'inden 256-bit AES anahtarı türet
     final keyBytes = sha256.convert(utf8.encode(roomId)).bytes;
     _encrypter = enc.Encrypter(
       enc.AES(enc.Key(Uint8List.fromList(keyBytes)), mode: enc.AESMode.cbc),
@@ -104,8 +106,10 @@ class WebRTCService {
     };
   }
 
+  // 2. MQTT WebSocket Sinyalleşme Hattı
   Future<void> _setupSignaling() async {
-    final clientId = 'cl_${_myId}';
+    final clientId =
+        'client_${_myId}_${DateTime.now().millisecondsSinceEpoch % 1000}';
     _mqttClient = MqttBrowserClient('wss://broker.emqx.io/mqtt', clientId);
     _mqttClient!.port = 8084;
     _mqttClient!.websocketProtocols =
@@ -116,7 +120,7 @@ class WebRTCService {
     try {
       await _mqttClient!.connect();
     } catch (e) {
-      debugPrint("Sinyal broker bağlantı hatası: $e");
+      debugPrint("MQTT Broker bağlantı hatası: $e");
       return;
     }
 
@@ -136,6 +140,7 @@ class WebRTCService {
 
       switch (data['type']) {
         case 'join':
+          // Yeni gelen cihaz için Offer oluştur
           await _createOffer();
           break;
         case 'offer':
@@ -153,7 +158,10 @@ class WebRTCService {
       }
     });
 
-    _sendSignal({'type': 'join', 'sender': _myId});
+    // Odaya katıldığımızı duyur
+    Timer(const Duration(milliseconds: 500), () {
+      _sendSignal({'type': 'join', 'sender': _myId});
+    });
   }
 
   void _sendSignal(Map<String, dynamic> data) {
@@ -215,7 +223,7 @@ class WebRTCService {
           onMessageReceived!(data['sender'], data['text']);
         }
       } catch (e) {
-        debugPrint("Chat okunamadı: $e");
+        debugPrint("DataChannel çözme hatası: $e");
       }
     };
   }
@@ -229,6 +237,7 @@ class WebRTCService {
     }
   }
 
+  // 3. Medya Akışları (Kamera, Mikrofon, Ekran)
   Future<MediaStream> initLocalStream() async {
     localStream = await navigator.mediaDevices.getUserMedia({
       'audio': true,
