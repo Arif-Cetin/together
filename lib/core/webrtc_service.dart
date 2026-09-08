@@ -1,9 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:crypto/crypto.dart';
 import 'package:encrypt/encrypt.dart' as enc;
+import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
@@ -12,14 +12,14 @@ import 'constants.dart';
 class WebRTCService {
   RTCPeerConnection? peerConnection;
   RTCDataChannel? dataChannel;
-  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  final FirebaseDatabase _database = FirebaseDatabase.instance;
 
   MediaStream? localStream;
   MediaStream? screenStream;
 
   String? _myId;
   String? _roomId;
-  DocumentReference? _roomRef;
+  DatabaseReference? _roomRef;
   StreamSubscription? _roomSub;
   StreamSubscription? _candidatesSub;
 
@@ -42,7 +42,7 @@ class WebRTCService {
       enc.AES(enc.Key(Uint8List.fromList(keyBytes)), mode: enc.AESMode.cbc),
     );
 
-    _roomRef = _firestore.collection('rooms').doc(_roomId);
+    _roomRef = _database.ref('rooms/$_roomId');
 
     await _initPeerConnection();
     await _startSignaling();
@@ -83,9 +83,9 @@ class WebRTCService {
         'sdpMLineIndex': candidate.sdpMLineIndex,
         'sender': _myId,
       });
-      _roomRef!.collection('candidates').add({
+      _roomRef!.child('candidates').push().set({
         'payload': cipher,
-        'createdAt': FieldValue.serverTimestamp(),
+        'sender': _myId,
       });
     };
 
@@ -111,10 +111,10 @@ class WebRTCService {
   }
 
   Future<void> _startSignaling() async {
-    final roomDoc = await _roomRef!.get();
+    final snapshot = await _roomRef!.get();
 
-    if (!roomDoc.exists || roomDoc.data() == null) {
-      // 1. Cihaz: Odayı kurup Offer bırakır
+    if (!snapshot.exists || snapshot.value == null) {
+      // 1. Cihaz: Odayı açıp Offer bırakır
       RTCSessionDescription offer = await peerConnection!.createOffer();
       await peerConnection!.setLocalDescription(offer);
 
@@ -123,17 +123,13 @@ class WebRTCService {
         'sdp': offer.sdp,
         'sender': _myId,
       });
-      await _roomRef!.set({
-        'offer': cipherOffer,
-        'createdAt': FieldValue.serverTimestamp(),
-      });
+      await _roomRef!.set({'offer': cipherOffer});
 
-      _roomSub = _roomRef!.snapshots().listen((snapshot) async {
-        final data = snapshot.data() as Map<String, dynamic>?;
-        if (data != null &&
-            data.containsKey('answer') &&
+      // İkinci cihazın bırakacağı cevabı (Answer) dinler
+      _roomSub = _roomRef!.child('answer').onValue.listen((event) async {
+        if (event.snapshot.value != null &&
             peerConnection?.getRemoteDescription() == null) {
-          final answerData = _decrypt(data['answer']);
+          final answerData = _decrypt(event.snapshot.value.toString());
           if (answerData != null && answerData['sender'] != _myId) {
             final desc = RTCSessionDescription(
               answerData['sdp'],
@@ -144,8 +140,8 @@ class WebRTCService {
         }
       });
     } else {
-      // 2. Cihaz: Odayı bulup Answer yazar
-      final roomData = roomDoc.data() as Map<String, dynamic>;
+      // 2. Cihaz: Var olan odaya katılır ve Answer yazar
+      final roomData = Map<String, dynamic>.from(snapshot.value as Map);
       if (roomData.containsKey('offer')) {
         final offerData = _decrypt(roomData['offer']);
         if (offerData != null) {
@@ -163,29 +159,26 @@ class WebRTCService {
             'sdp': answer.sdp,
             'sender': _myId,
           });
-          await _roomRef!.update({'answer': cipherAnswer});
+          await _roomRef!.child('answer').set(cipherAnswer);
         }
       }
     }
 
-    // Karşı tarafın ICE adaylarını dinleme
-    _candidatesSub = _roomRef!.collection('candidates').snapshots().listen((
-      snapshot,
-    ) {
-      for (var change in snapshot.docChanges) {
-        if (change.type == DocumentChangeType.added) {
-          final data = change.doc.data();
-          if (data != null && data.containsKey('payload')) {
-            final cData = _decrypt(data['payload']);
-            if (cData != null && cData['sender'] != _myId) {
-              peerConnection?.addCandidate(
-                RTCIceCandidate(
-                  cData['candidate'],
-                  cData['sdpMid'],
-                  cData['sdpMLineIndex'],
-                ),
-              );
-            }
+    // Karşı tarafın ICE adaylarını dinle
+    _candidatesSub = _roomRef!.child('candidates').onChildAdded.listen((event) {
+      final val = event.snapshot.value;
+      if (val != null) {
+        final data = Map<String, dynamic>.from(val as Map);
+        if (data.containsKey('payload')) {
+          final cData = _decrypt(data['payload']);
+          if (cData != null && cData['sender'] != _myId) {
+            peerConnection?.addCandidate(
+              RTCIceCandidate(
+                cData['candidate'],
+                cData['sdpMid'],
+                cData['sdpMLineIndex'],
+              ),
+            );
           }
         }
       }
