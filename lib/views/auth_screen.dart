@@ -1,7 +1,7 @@
-import 'package:flutter/material.dart';
-import 'package:crypto/crypto.dart';
-
 import 'dart:convert';
+
+import 'package:crypto/crypto.dart';
+import 'package:flutter/material.dart';
 
 import '../core/constants.dart';
 import 'stage_screen.dart';
@@ -15,42 +15,33 @@ class AuthScreen extends StatefulWidget {
 
 class _AuthScreenState extends State<AuthScreen> {
   final TextEditingController _userController = TextEditingController();
-  final TextEditingController _pinController = TextEditingController();
+  final TextEditingController _passController = TextEditingController();
   bool _hasError = false;
 
+  String _hashPassword(String password) {
+    final bytes = utf8.encode(password);
+    return sha256.convert(bytes).toString();
+  }
+
   void _login() {
-    final username = _userController.text.trim();
-    final enteredPass = _pinController.text.trim();
+    final user = _userController.text.trim();
+    final pass = _passController.text.trim();
 
-    if (username.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Lütfen bir kullanıcı adı girin!')),
+    if (user.isEmpty || pass.isEmpty) return;
+
+    final hash = _hashPassword(pass);
+    if (hash == AppConfig.expectedHash) {
+      setState(() => _hasError = false);
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+          builder: (context) =>
+              StageScreen(username: user, roomHash: hash.substring(0, 16)),
+        ),
       );
-      return;
+    } else {
+      setState(() => _hasError = true);
     }
-
-    // SHA-256 Özeti Çıkarma (Güvenlik Katmanı)
-    final bytes = utf8.encode(enteredPass);
-    final hash = sha256.convert(bytes).toString();
-
-    if (hash != AppConfig.expectedHash) {
-      setState(() {
-        _hasError = true;
-        _pinController.clear();
-      });
-      return;
-    }
-
-    setState(() => _hasError = false);
-
-    // Başarılı girişte doğrudan sinema odasına geçiş
-    Navigator.pushReplacement(
-      context,
-      MaterialPageRoute(
-        builder: (_) =>
-            StageScreen(username: username, roomHash: hash.substring(0, 16)),
-      ),
-    );
   }
 
   @override
@@ -59,146 +50,91 @@ class _AuthScreenState extends State<AuthScreen> {
       backgroundColor: AppColors.bgDarkest,
       body: Center(
         child: SingleChildScrollView(
-          padding: const EdgeInsets.all(24.0),
+          padding: const EdgeInsets.all(24),
           child: Container(
-            constraints: const BoxConstraints(maxWidth: 380),
-            padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 34),
+            constraints: const BoxConstraints(maxWidth: 400),
+            padding: const EdgeInsets.all(28),
             decoration: BoxDecoration(
-              gradient: const LinearGradient(
-                colors: [Color(0xFF181028), Color(0xFF0D1A14)],
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-              ),
-              borderRadius: BorderRadius.circular(22),
+              color: AppColors.glassBg,
+              borderRadius: BorderRadius.circular(20),
               border: Border.all(color: AppColors.glassBorder),
-              boxShadow: const [
-                BoxShadow(
-                  color: Colors.black87,
-                  blurRadius: 35,
-                  offset: Offset(0, 15),
-                ),
-              ],
             ),
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                // Neon Ev İkonu
-                Container(
-                  width: 68,
-                  height: 68,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    gradient: const LinearGradient(
-                      colors: [AppColors.neonGreen, AppColors.neonPurple],
-                    ),
-                    boxShadow: [
-                      BoxShadow(
-                        color: AppColors.neonGreen.withOpacity(0.4),
-                        blurRadius: 20,
-                      ),
-                    ],
-                  ),
-                  child: const Icon(Icons.home, color: Colors.white, size: 30),
+                const Icon(
+                  Icons.home,
+                  size: 54,
+                  color: AppColors.neonPurpleBright,
                 ),
-                const SizedBox(height: 16),
+                const SizedBox(height: 12),
                 const Text(
-                  'together',
+                  "together",
                   style: TextStyle(
-                    fontSize: 22,
-                    fontWeight: FontWeight.w800,
+                    fontSize: 24,
+                    fontWeight: FontWeight.bold,
                     color: Colors.white,
-                    letterSpacing: 0.5,
                   ),
                 ),
-                const SizedBox(height: 6),
+                const SizedBox(height: 4),
                 const Text(
-                  'Bizim Özel VIP Sinemamız',
-                  style: TextStyle(fontSize: 13, color: AppColors.textMuted),
+                  "Kullanıcı adını ve şifreyi doğrula.",
+                  style: TextStyle(color: AppColors.textMuted, fontSize: 13),
                 ),
                 const SizedBox(height: 24),
-
-                // Kullanıcı Adı
                 TextField(
                   controller: _userController,
                   style: const TextStyle(color: Colors.white),
                   decoration: InputDecoration(
-                    labelText: 'KULLANICI ADIN',
-                    labelStyle: const TextStyle(
-                      color: AppColors.neonGreenBright,
-                      fontSize: 11,
-                      fontWeight: FontWeight.bold,
-                    ),
+                    labelText: "Kullanıcı Adın",
+                    labelStyle: const TextStyle(color: AppColors.textMuted),
                     filled: true,
                     fillColor: AppColors.inputBg,
                     border: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(12),
-                      borderSide: BorderSide.none,
                     ),
                   ),
                 ),
-                const SizedBox(height: 14),
-
-                // Şifre
+                const SizedBox(height: 16),
                 TextField(
-                  controller: _pinController,
+                  controller: _passController,
                   obscureText: true,
                   style: const TextStyle(color: Colors.white),
-                  onSubmitted: (_) => _login(),
                   decoration: InputDecoration(
-                    labelText: 'ODA ŞİFRESİ',
-                    labelStyle: const TextStyle(
-                      color: AppColors.neonGreenBright,
-                      fontSize: 11,
-                      fontWeight: FontWeight.bold,
-                    ),
+                    labelText: "Oda Şifresi",
+                    labelStyle: const TextStyle(color: AppColors.textMuted),
                     filled: true,
                     fillColor: AppColors.inputBg,
                     border: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(12),
-                      borderSide: BorderSide.none,
                     ),
                   ),
+                  onSubmitted: (_) => _login(),
                 ),
                 if (_hasError) ...[
-                  const SizedBox(height: 10),
+                  const SizedBox(height: 12),
                   const Text(
-                    'Girdiğin şifre hatalı!',
-                    style: TextStyle(color: AppColors.danger, fontSize: 12),
+                    "Girdiğin şifre hatalı!",
+                    style: TextStyle(color: AppColors.danger, fontSize: 13),
                   ),
                 ],
-                const SizedBox(height: 20),
-
-                // Giriş Butonu
+                const SizedBox(height: 24),
                 SizedBox(
                   width: double.infinity,
                   height: 48,
                   child: ElevatedButton(
-                    onPressed: _login,
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.transparent,
-                      shadowColor: Colors.transparent,
-                      padding: EdgeInsets.zero,
+                      backgroundColor: AppColors.neonPurple,
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(12),
                       ),
                     ),
-                    child: Ink(
-                      decoration: BoxDecoration(
-                        gradient: const LinearGradient(
-                          colors: [AppColors.neonGreen, AppColors.neonPurple],
-                        ),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Container(
-                        alignment: Alignment.center,
-                        child: const Text(
-                          'Odaya Katıl',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.bold,
-                            fontSize: 15,
-                          ),
-                        ),
+                    onPressed: _login,
+                    child: const Text(
+                      "Odaya Katıl",
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
                       ),
                     ),
                   ),
