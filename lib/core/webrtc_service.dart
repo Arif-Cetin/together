@@ -1,25 +1,27 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:crypto/crypto.dart';
 import 'package:encrypt/encrypt.dart' as enc;
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
-import 'package:http/http.dart' as http;
-import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'constants.dart';
 
 class WebRTCService {
   RTCPeerConnection? peerConnection;
   RTCDataChannel? dataChannel;
-  WebSocketChannel? _wsChannel;
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
   MediaStream? localStream;
   MediaStream? screenStream;
 
   String? _myId;
   String? _roomId;
+  DocumentReference? _roomRef;
+  StreamSubscription? _roomSub;
+  StreamSubscription? _candidatesSub;
 
   enc.Encrypter? _encrypter;
   final _iv = enc.IV.fromLength(16);
@@ -35,14 +37,15 @@ class WebRTCService {
     _roomId = roomId;
     _myId = '${username}_${DateTime.now().millisecondsSinceEpoch % 10000}';
 
-    // Şifre hash'inden 32-byte AES anahtarı üret
     final keyBytes = sha256.convert(utf8.encode(roomId)).bytes;
     _encrypter = enc.Encrypter(
       enc.AES(enc.Key(Uint8List.fromList(keyBytes)), mode: enc.AESMode.cbc),
     );
 
+    _roomRef = _firestore.collection('rooms').doc(_roomId);
+
     await _initPeerConnection();
-    _startSignaling();
+    await _startSignaling();
   }
 
   String _encrypt(Map<String, dynamic> data) {
@@ -73,14 +76,16 @@ class WebRTCService {
     };
 
     peerConnection!.onIceCandidate = (RTCIceCandidate candidate) {
-      _sendSignal({
-        'type': 'candidate',
-        'candidate': {
-          'candidate': candidate.candidate,
-          'sdpMid': candidate.sdpMid,
-          'sdpMLineIndex': candidate.sdpMLineIndex,
-        },
+      if (_roomRef == null) return;
+      final cipher = _encrypt({
+        'candidate': candidate.candidate,
+        'sdpMid': candidate.sdpMid,
+        'sdpMLineIndex': candidate.sdpMLineIndex,
         'sender': _myId,
+      });
+      _roomRef!.collection('candidates').add({
+        'payload': cipher,
+        'createdAt': FieldValue.serverTimestamp(),
       });
     };
 
@@ -94,7 +99,7 @@ class WebRTCService {
 
     RTCDataChannelInit dataChannelDict = RTCDataChannelInit()..ordered = true;
     dataChannel = await peerConnection!.createDataChannel(
-      "chatChannel",
+      "secureChat",
       dataChannelDict,
     );
     _setupDataChannel(dataChannel!);
@@ -105,98 +110,86 @@ class WebRTCService {
     };
   }
 
-  void _startSignaling() {
-    final topic = 'together_mesh_room_$_roomId';
-    final wsUrl = Uri.parse('wss://ntfy.sh/$topic/ws');
+  Future<void> _startSignaling() async {
+    final roomDoc = await _roomRef!.get();
 
-    try {
-      _wsChannel = WebSocketChannel.connect(wsUrl);
+    if (!roomDoc.exists || roomDoc.data() == null) {
+      // 1. Cihaz: Odayı kurup Offer bırakır
+      RTCSessionDescription offer = await peerConnection!.createOffer();
+      await peerConnection!.setLocalDescription(offer);
 
-      _wsChannel!.stream.listen((event) async {
-        try {
-          final msg = jsonDecode(event);
-          if (msg['event'] != 'message' || msg['message'] == null) return;
+      final cipherOffer = _encrypt({
+        'type': offer.type,
+        'sdp': offer.sdp,
+        'sender': _myId,
+      });
+      await _roomRef!.set({
+        'offer': cipherOffer,
+        'createdAt': FieldValue.serverTimestamp(),
+      });
 
-          final data = _decrypt(msg['message']);
-          if (data == null || data['sender'] == _myId) return;
+      _roomSub = _roomRef!.snapshots().listen((snapshot) async {
+        final data = snapshot.data() as Map<String, dynamic>?;
+        if (data != null &&
+            data.containsKey('answer') &&
+            peerConnection?.getRemoteDescription() == null) {
+          final answerData = _decrypt(data['answer']);
+          if (answerData != null && answerData['sender'] != _myId) {
+            final desc = RTCSessionDescription(
+              answerData['sdp'],
+              answerData['type'],
+            );
+            await peerConnection!.setRemoteDescription(desc);
+          }
+        }
+      });
+    } else {
+      // 2. Cihaz: Odayı bulup Answer yazar
+      final roomData = roomDoc.data() as Map<String, dynamic>;
+      if (roomData.containsKey('offer')) {
+        final offerData = _decrypt(roomData['offer']);
+        if (offerData != null) {
+          final desc = RTCSessionDescription(
+            offerData['sdp'],
+            offerData['type'],
+          );
+          await peerConnection!.setRemoteDescription(desc);
 
-          switch (data['type']) {
-            case 'join':
-              // Yeni bir cihaz geldiğinde Offer üret
-              await _createOffer();
-              break;
-            case 'offer':
-              await _handleOffer(data['sdp']);
-              break;
-            case 'answer':
-              await _handleAnswer(data['sdp']);
-              break;
-            case 'candidate':
-              final c = data['candidate'];
-              await peerConnection?.addCandidate(
+          RTCSessionDescription answer = await peerConnection!.createAnswer();
+          await peerConnection!.setLocalDescription(answer);
+
+          final cipherAnswer = _encrypt({
+            'type': answer.type,
+            'sdp': answer.sdp,
+            'sender': _myId,
+          });
+          await _roomRef!.update({'answer': cipherAnswer});
+        }
+      }
+    }
+
+    // Karşı tarafın ICE adaylarını dinleme
+    _candidatesSub = _roomRef!.collection('candidates').snapshots().listen((
+      snapshot,
+    ) {
+      for (var change in snapshot.docChanges) {
+        if (change.type == DocumentChangeType.added) {
+          final data = change.doc.data();
+          if (data != null && data.containsKey('payload')) {
+            final cData = _decrypt(data['payload']);
+            if (cData != null && cData['sender'] != _myId) {
+              peerConnection?.addCandidate(
                 RTCIceCandidate(
-                  c['candidate'],
-                  c['sdpMid'],
-                  c['sdpMLineIndex'],
+                  cData['candidate'],
+                  cData['sdpMid'],
+                  cData['sdpMLineIndex'],
                 ),
               );
-              break;
+            }
           }
-        } catch (_) {}
-      });
-
-      // Odaya katıldığını anons et
-      Timer(const Duration(milliseconds: 600), () {
-        _sendSignal({'type': 'join', 'sender': _myId});
-      });
-    } catch (e) {
-      debugPrint("Sinyal hattı hatası: $e");
-    }
-  }
-
-  Future<void> _sendSignal(Map<String, dynamic> data) async {
-    if (_encrypter == null) return;
-    final cipher = _encrypt(data);
-    final topic = 'together_mesh_room_$_roomId';
-
-    try {
-      await http.post(Uri.parse('https://ntfy.sh/$topic'), body: cipher);
-    } catch (_) {}
-  }
-
-  Future<void> _createOffer() async {
-    RTCSessionDescription offer = await peerConnection!.createOffer();
-    await peerConnection!.setLocalDescription(offer);
-    _sendSignal({
-      'type': 'offer',
-      'sdp': {'type': offer.type, 'sdp': offer.sdp},
-      'sender': _myId,
+        }
+      }
     });
-  }
-
-  Future<void> _handleOffer(Map<String, dynamic> sdpMap) async {
-    RTCSessionDescription desc = RTCSessionDescription(
-      sdpMap['sdp'],
-      sdpMap['type'],
-    );
-    await peerConnection!.setRemoteDescription(desc);
-
-    RTCSessionDescription answer = await peerConnection!.createAnswer();
-    await peerConnection!.setLocalDescription(answer);
-
-    _sendSignal({
-      'type': 'answer',
-      'sdp': {'type': answer.type, 'sdp': answer.sdp},
-      'sender': _myId,
-    });
-  }
-
-  Future<void> _handleAnswer(Map<String, dynamic> sdpMap) async {
-    RTCSessionDescription desc = RTCSessionDescription(
-      sdpMap['sdp'],
-      sdpMap['type'],
-    );
-    await peerConnection!.setRemoteDescription(desc);
   }
 
   void _setupDataChannel(RTCDataChannel channel) {
@@ -268,12 +261,13 @@ class WebRTCService {
   }
 
   Future<void> dispose() async {
+    await _roomSub?.cancel();
+    await _candidatesSub?.cancel();
     localStream?.getTracks().forEach((t) => t.stop());
     screenStream?.getTracks().forEach((t) => t.stop());
     await localStream?.dispose();
     await screenStream?.dispose();
     await dataChannel?.close();
     await peerConnection?.close();
-    await _wsChannel?.sink.close();
   }
 }
