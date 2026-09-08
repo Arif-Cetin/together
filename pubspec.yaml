@@ -34,7 +34,8 @@ dependencies:
   crypto: ^3.0.6
   encrypt: ^5.0.3
   shared_preferences: ^2.2.2
-  mqtt_client: ^10.3.3
+  web_socket_channel: ^3.0.1
+  http: ^1.2.1
 
 dev_dependencies:
   flutter_test:

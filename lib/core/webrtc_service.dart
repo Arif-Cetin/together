@@ -5,15 +5,15 @@ import 'package:crypto/crypto.dart';
 import 'package:encrypt/encrypt.dart' as enc;
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
-import 'package:mqtt_client/mqtt_browser_client.dart';
-import 'package:mqtt_client/mqtt_client.dart';
+import 'package:http/http.dart' as http;
+import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'constants.dart';
 
 class WebRTCService {
   RTCPeerConnection? peerConnection;
   RTCDataChannel? dataChannel;
-  MqttBrowserClient? _mqttClient;
+  WebSocketChannel? _wsChannel;
 
   MediaStream? localStream;
   MediaStream? screenStream;
@@ -31,28 +31,27 @@ class WebRTCService {
   Function(String sender, String text)? onMessageReceived;
   Function(bool isConnected)? onConnectionStateChanged;
 
-  // 1. Odaya Bağlan ve Sinyalleşmeyi Başlat
   Future<void> connectToRoom(String roomId, String username) async {
     _roomId = roomId;
     _myId = '${username}_${DateTime.now().millisecondsSinceEpoch % 10000}';
 
-    // Şifre hash'inden 256-bit AES anahtarı türet
+    // Şifre hash'inden 32-byte AES anahtarı üret
     final keyBytes = sha256.convert(utf8.encode(roomId)).bytes;
     _encrypter = enc.Encrypter(
       enc.AES(enc.Key(Uint8List.fromList(keyBytes)), mode: enc.AESMode.cbc),
     );
 
     await _initPeerConnection();
-    await _setupSignaling();
+    _startSignaling();
   }
 
-  String _encryptPayload(Map<String, dynamic> data) {
+  String _encrypt(Map<String, dynamic> data) {
     return _encrypter!.encrypt(jsonEncode(data), iv: _iv).base64;
   }
 
-  Map<String, dynamic>? _decryptPayload(String cipherText) {
+  Map<String, dynamic>? _decrypt(String cipher) {
     try {
-      final decrypted = _encrypter!.decrypt64(cipherText, iv: _iv);
+      final decrypted = _encrypter!.decrypt64(cipher, iv: _iv);
       return jsonDecode(decrypted);
     } catch (_) {
       return null;
@@ -106,77 +105,63 @@ class WebRTCService {
     };
   }
 
-  // 2. MQTT WebSocket Sinyalleşme Hattı
-  Future<void> _setupSignaling() async {
-    final clientId =
-        'client_${_myId}_${DateTime.now().millisecondsSinceEpoch % 1000}';
-    _mqttClient = MqttBrowserClient('wss://broker.emqx.io/mqtt', clientId);
-    _mqttClient!.port = 8084;
-    _mqttClient!.websocketProtocols =
-        MqttClientConstants.protocolsSingleDefault;
-    _mqttClient!.logging(on: false);
-    _mqttClient!.keepAlivePeriod = 20;
+  void _startSignaling() {
+    final topic = 'together_mesh_room_$_roomId';
+    final wsUrl = Uri.parse('wss://ntfy.sh/$topic/ws');
 
     try {
-      await _mqttClient!.connect();
+      _wsChannel = WebSocketChannel.connect(wsUrl);
+
+      _wsChannel!.stream.listen((event) async {
+        try {
+          final msg = jsonDecode(event);
+          if (msg['event'] != 'message' || msg['message'] == null) return;
+
+          final data = _decrypt(msg['message']);
+          if (data == null || data['sender'] == _myId) return;
+
+          switch (data['type']) {
+            case 'join':
+              // Yeni bir cihaz geldiğinde Offer üret
+              await _createOffer();
+              break;
+            case 'offer':
+              await _handleOffer(data['sdp']);
+              break;
+            case 'answer':
+              await _handleAnswer(data['sdp']);
+              break;
+            case 'candidate':
+              final c = data['candidate'];
+              await peerConnection?.addCandidate(
+                RTCIceCandidate(
+                  c['candidate'],
+                  c['sdpMid'],
+                  c['sdpMLineIndex'],
+                ),
+              );
+              break;
+          }
+        } catch (_) {}
+      });
+
+      // Odaya katıldığını anons et
+      Timer(const Duration(milliseconds: 600), () {
+        _sendSignal({'type': 'join', 'sender': _myId});
+      });
     } catch (e) {
-      debugPrint("MQTT Broker bağlantı hatası: $e");
-      return;
+      debugPrint("Sinyal hattı hatası: $e");
     }
-
-    final topic = 'together/room/$_roomId';
-    _mqttClient!.subscribe(topic, MqttQos.atLeastOnce);
-
-    _mqttClient!.updates!.listen((
-      List<MqttReceivedMessage<MqttMessage>> c,
-    ) async {
-      final recMess = c[0].payload as MqttPublishMessage;
-      final pt = MqttPublishPayload.bytesToStringAsString(
-        recMess.payload.message,
-      );
-
-      final data = _decryptPayload(pt);
-      if (data == null || data['sender'] == _myId) return;
-
-      switch (data['type']) {
-        case 'join':
-          // Yeni gelen cihaz için Offer oluştur
-          await _createOffer();
-          break;
-        case 'offer':
-          await _handleOffer(data['sdp']);
-          break;
-        case 'answer':
-          await _handleAnswer(data['sdp']);
-          break;
-        case 'candidate':
-          final cd = data['candidate'];
-          await peerConnection?.addCandidate(
-            RTCIceCandidate(cd['candidate'], cd['sdpMid'], cd['sdpMLineIndex']),
-          );
-          break;
-      }
-    });
-
-    // Odaya katıldığımızı duyur
-    Timer(const Duration(milliseconds: 500), () {
-      _sendSignal({'type': 'join', 'sender': _myId});
-    });
   }
 
-  void _sendSignal(Map<String, dynamic> data) {
-    if (_mqttClient == null ||
-        _mqttClient!.connectionStatus!.state != MqttConnectionState.connected) {
-      return;
-    }
-    final cipher = _encryptPayload(data);
-    final builder = MqttClientPayloadBuilder();
-    builder.addString(cipher);
-    _mqttClient!.publishMessage(
-      'together/room/$_roomId',
-      MqttQos.atLeastOnce,
-      builder.payload!,
-    );
+  Future<void> _sendSignal(Map<String, dynamic> data) async {
+    if (_encrypter == null) return;
+    final cipher = _encrypt(data);
+    final topic = 'together_mesh_room_$_roomId';
+
+    try {
+      await http.post(Uri.parse('https://ntfy.sh/$topic'), body: cipher);
+    } catch (_) {}
   }
 
   Future<void> _createOffer() async {
@@ -222,9 +207,7 @@ class WebRTCService {
         if (data['type'] == 'msg' && onMessageReceived != null) {
           onMessageReceived!(data['sender'], data['text']);
         }
-      } catch (e) {
-        debugPrint("DataChannel çözme hatası: $e");
-      }
+      } catch (_) {}
     };
   }
 
@@ -237,7 +220,6 @@ class WebRTCService {
     }
   }
 
-  // 3. Medya Akışları (Kamera, Mikrofon, Ekran)
   Future<MediaStream> initLocalStream() async {
     localStream = await navigator.mediaDevices.getUserMedia({
       'audio': true,
@@ -292,6 +274,6 @@ class WebRTCService {
     await screenStream?.dispose();
     await dataChannel?.close();
     await peerConnection?.close();
-    _mqttClient?.disconnect();
+    await _wsChannel?.sink.close();
   }
 }
