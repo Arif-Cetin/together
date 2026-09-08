@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:crypto/crypto.dart';
+import 'package:encrypt/encrypt.dart' as enc;
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -17,7 +19,10 @@ class WebRTCService {
 
   String? _myId;
   String? _roomId;
-  bool isHost = false;
+
+  // Güvenlik: Paroladan türetilen AES Şifreleme Motoru
+  enc.Encrypter? _encrypter;
+  final _iv = enc.IV.fromLength(16);
 
   bool isMicMuted = false;
   bool isCamOff = false;
@@ -26,13 +31,36 @@ class WebRTCService {
   Function(String sender, String text)? onMessageReceived;
   Function(bool isConnected)? onConnectionStateChanged;
 
-  // 1. Odaya Bağlan ve Sinyalleşmeyi Başlat
+  // 1. Odaya Bağlan ve Güvenli Sinyalleşmeyi Başlat
   Future<void> connectToRoom(String roomId, String username) async {
     _roomId = roomId;
     _myId = '${username}_${DateTime.now().millisecondsSinceEpoch % 10000}';
 
+    // Şifre hash'inden 32-byte (256-bit) AES anahtarı türet
+    final keyBytes = sha256.convert(utf8.encode(roomId)).bytes;
+    _encrypter = enc.Encrypter(
+      enc.AES(enc.Key(Uint8List.fromList(keyBytes)), mode: enc.AESMode.cbc),
+    );
+
     await _initPeerConnection();
     _connectSignaling();
+  }
+
+  // Paketleri şifreleyerek gönderme
+  String _encryptPayload(Map<String, dynamic> data) {
+    final rawJson = jsonEncode(data);
+    return _encrypter!.encrypt(rawJson, iv: _iv).base64;
+  }
+
+  // Gelen şifreli paketi çözme
+  Map<String, dynamic>? _decryptPayload(String cipherText) {
+    try {
+      final decrypted = _encrypter!.decrypt64(cipherText, iv: _iv);
+      return jsonDecode(decrypted);
+    } catch (e) {
+      // Başka şifreyle odayı dinlemeye çalışan biri varsa paketi çözemez
+      return null;
+    }
   }
 
   Future<void> _initPeerConnection() async {
@@ -43,14 +71,12 @@ class WebRTCService {
       ],
     });
 
-    // Uzaktan medya akışı geldiğinde
     peerConnection!.onTrack = (RTCTrackEvent event) {
       if (event.streams.isNotEmpty && onRemoteStreamAdded != null) {
         onRemoteStreamAdded!(event.streams[0]);
       }
     };
 
-    // ICE Candidate toplanınca diğer tarafa ilet
     peerConnection!.onIceCandidate = (RTCIceCandidate candidate) {
       _sendSignal({
         'type': 'candidate',
@@ -71,10 +97,10 @@ class WebRTCService {
       }
     };
 
-    // Data Channel (Sohbet)
+    // Güvenli Data Channel (Sohbet)
     RTCDataChannelInit dataChannelDict = RTCDataChannelInit()..ordered = true;
     dataChannel = await peerConnection!.createDataChannel(
-      "chatChannel",
+      "secureChat",
       dataChannelDict,
     );
     _setupDataChannel(dataChannel!);
@@ -85,21 +111,25 @@ class WebRTCService {
     };
   }
 
-  // 2. Ücretsiz Genel Sinyalleşme Broker'ı (P2P El Sıkışması İçin)
+  // 2. Gerçek Çok Kullanıcılı Güvenli Sinyal Kanalı
   void _connectSignaling() {
     try {
-      // Ücretsiz ve genel PieSocket / echo sinyalleşme endpoint'i
-      final uri = Uri.parse('wss://echo.websocket.events');
+      // Ortak çalışan ntfy WebSocket soketi (Echo yerine gerçek yayın yapar)
+      final uri = Uri.parse('wss://ntfy.sh/together_${_roomId}/ws');
       _signalingChannel = WebSocketChannel.connect(uri);
 
       _signalingChannel!.stream.listen((message) async {
         try {
-          final data = jsonDecode(message);
-          if (data['room'] != _roomId || data['sender'] == _myId) return;
+          final eventData = jsonDecode(message);
+          if (eventData['event'] != 'message' || eventData['message'] == null)
+            return;
+
+          // Gelen şifreli sinyali çöz
+          final data = _decryptPayload(eventData['message']);
+          if (data == null || data['sender'] == _myId) return;
 
           switch (data['type']) {
             case 'join':
-              // Odaya yeni biri geldi, biz eskiysek Offer üret
               await _createOffer();
               break;
 
@@ -122,20 +152,26 @@ class WebRTCService {
               break;
           }
         } catch (e) {
-          debugPrint("Sinyal parse hatası: $e");
+          debugPrint("Sinyal çözümleme: $e");
         }
       });
 
-      // Odaya girdiğimizi anons et
+      // Odaya katıldığımızı anons et
       _sendSignal({'type': 'join', 'sender': _myId});
     } catch (e) {
-      debugPrint("Sinyal soket bağlantı hatası: $e");
+      debugPrint("Soket bağlantı hatası: $e");
     }
   }
 
   void _sendSignal(Map<String, dynamic> data) {
-    data['room'] = _roomId;
-    _signalingChannel?.sink.add(jsonEncode(data));
+    if (_encrypter == null) return;
+    final encryptedData = _encryptPayload(data);
+
+    // Odaya HTTP POST ile şifreli paket bırakılır, WebSocket anında diğer cihaza basar
+    // (Flutter Web için sıfır maliyetli ve güvenli köprü)
+    _signalingChannel?.sink.add(
+      jsonEncode({'action': 'send', 'message': encryptedData}),
+    );
   }
 
   Future<void> _createOffer() async {
@@ -176,12 +212,13 @@ class WebRTCService {
   void _setupDataChannel(RTCDataChannel channel) {
     channel.onMessage = (RTCDataChannelMessage message) {
       try {
-        final data = jsonDecode(message.text);
+        final decryptedText = _encrypter!.decrypt64(message.text, iv: _iv);
+        final data = jsonDecode(decryptedText);
         if (data['type'] == 'msg' && onMessageReceived != null) {
           onMessageReceived!(data['sender'], data['text']);
         }
       } catch (e) {
-        debugPrint("Veri kanalı mesaj hatası: $e");
+        debugPrint("Chat paketi çözülemedi: $e");
       }
     };
   }
@@ -189,16 +226,13 @@ class WebRTCService {
   void sendMessage(String sender, String text) {
     if (dataChannel != null &&
         dataChannel!.state == RTCDataChannelState.RTCDataChannelOpen) {
-      final payload = jsonEncode({
-        'type': 'msg',
-        'sender': sender,
-        'text': text,
-      });
-      dataChannel!.send(RTCDataChannelMessage(payload));
+      final raw = jsonEncode({'type': 'msg', 'sender': sender, 'text': text});
+      final encrypted = _encrypter!.encrypt(raw, iv: _iv).base64;
+      dataChannel!.send(RTCDataChannelMessage(encrypted));
     }
   }
 
-  // 3. Medya Fonksiyonları
+  // 3. Medya Akışları
   Future<MediaStream> initLocalStream() async {
     final Map<String, dynamic> mediaConstraints = {
       'audio': true,
