@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/constants.dart';
 import 'stage_screen.dart';
@@ -17,13 +18,39 @@ class _AuthScreenState extends State<AuthScreen> {
   final TextEditingController _userController = TextEditingController();
   final TextEditingController _passController = TextEditingController();
   bool _hasError = false;
+  bool _isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _checkSavedSession();
+  }
+
+  // Sayfa açıldığında veya yenilendiğinde eski oturumu hatırla
+  Future<void> _checkSavedSession() async {
+    final prefs = await SharedPreferences.getInstance();
+    final savedUser = prefs.getString('wt_user');
+    final savedHash = prefs.getString('wt_hash');
+
+    if (savedUser != null && savedHash != null && mounted) {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+          builder: (context) =>
+              StageScreen(username: savedUser, roomHash: savedHash),
+        ),
+      );
+    } else {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
 
   String _hashPassword(String password) {
     final bytes = utf8.encode(password);
     return sha256.convert(bytes).toString();
   }
 
-  void _login() {
+  Future<void> _login() async {
     final user = _userController.text.trim();
     final pass = _passController.text.trim();
 
@@ -32,13 +59,21 @@ class _AuthScreenState extends State<AuthScreen> {
     final hash = _hashPassword(pass);
     if (hash == AppConfig.expectedHash) {
       setState(() => _hasError = false);
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(
-          builder: (context) =>
-              StageScreen(username: user, roomHash: hash.substring(0, 16)),
-        ),
-      );
+
+      // Oturumu kalıcı kaydet
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('wt_user', user);
+      await prefs.setString('wt_hash', hash.substring(0, 16));
+
+      if (mounted) {
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+            builder: (context) =>
+                StageScreen(username: user, roomHash: hash.substring(0, 16)),
+          ),
+        );
+      }
     } else {
       setState(() => _hasError = true);
     }
@@ -46,6 +81,15 @@ class _AuthScreenState extends State<AuthScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (_isLoading) {
+      return const Scaffold(
+        backgroundColor: AppColors.bgDarkest,
+        body: Center(
+          child: CircularProgressIndicator(color: AppColors.neonPurpleBright),
+        ),
+      );
+    }
+
     return Scaffold(
       backgroundColor: AppColors.bgDarkest,
       body: Center(

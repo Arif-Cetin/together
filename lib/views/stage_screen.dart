@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
+import 'auth_screen.dart';
 import '../core/constants.dart';
 import '../core/webrtc_service.dart';
 
@@ -436,7 +438,21 @@ class _StageScreenState extends State<StageScreen> {
                     style: IconButton.styleFrom(
                       backgroundColor: AppColors.danger,
                     ),
-                    onPressed: () => Navigator.pop(context),
+                    onPressed: () async {
+                      // Sadece kırmızı tuşa basıldığında oturumu sil
+                      final prefs = await SharedPreferences.getInstance();
+                      await prefs.remove('wt_user');
+                      await prefs.remove('wt_hash');
+
+                      if (context.mounted) {
+                        Navigator.pushReplacement(
+                          context,
+                          MaterialPageRoute(
+                            builder: (context) => const AuthScreen(),
+                          ),
+                        );
+                      }
+                    },
                   ),
                 ],
               ),
